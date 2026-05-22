@@ -1,0 +1,16 @@
+[Unit]
+Description=FastClaw Memory Proxy - Context Offloading Service
+After=network.target
+
+[Service]
+Type=simple
+User=shyky
+WorkingDirectory=/home/shyky/.fastclaw/memory-proxy
+ExecStart=/home/shyky/.fastclaw/memory-proxy/memory-proxy -config /home/shyky/.fastclaw/memory-proxy/config.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

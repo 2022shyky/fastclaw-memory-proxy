@@ -1,0 +1,12 @@
+# FastClaw Memory Proxy 配置示例
+# 复制此文件为 config.yaml 并填入实际值
+listen: ":18954"
+target: "http://localhost:18953"          # FastClaw API 地址
+api_key: "your-fastclaw-api-key-here"    # FastClaw API Key
+data_dir: "~/.fastclaw/memory-proxy"     # 数据存储目录
+agents:
+  - agent_id_1
+  - agent_id_2
+stats:
+  enabled: true
+  output: "~/.fastclaw/memory-proxy/stats"
