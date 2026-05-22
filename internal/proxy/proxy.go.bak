@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http/httputil"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,7 +23,6 @@ type MemoryProxy struct {
 	stats     *stats.Collector
 	memory    *memory.Store
 	toolNames map[string]string // tool_call id → name mapping
-	toolArgs map[string]string // tool_call id → arguments
 }
 
 func New(cfg *config.Config) (*MemoryProxy, error) {
@@ -40,7 +37,6 @@ func New(cfg *config.Config) (*MemoryProxy, error) {
 		stats:     stats.New(cfg),
 		memory:    store,
 		toolNames: make(map[string]string),
-		toolArgs: make(map[string]string),
 	}, nil
 }
 
@@ -50,14 +46,6 @@ func (p *MemoryProxy) Start() error {
 	mux.HandleFunc("/api/chat", p.handleChat)
 	mux.HandleFunc("/api/chat/stream", p.handleChatStream)
 	mux.HandleFunc("/health", p.handleHealth)
-
-	// Default catch-all: reverse proxy everything else to FastClaw
-	targetURL, _ := url.Parse(p.cfg.Target)
-	rp := httputil.NewSingleHostReverseProxy(targetURL)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug("passthrough", "path", r.URL.Path, "method", r.Method)
-		rp.ServeHTTP(w, r)
-	})
 
 	slog.Info("Memory Proxy starting", "listen", p.cfg.Listen, "target", p.cfg.Target)
 	return http.ListenAndServe(p.cfg.Listen, mux)
@@ -239,9 +227,6 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 			if id, ok := data["id"].(string); ok {
 				if name, ok := data["name"].(string); ok {
 					p.toolNames[id] = name
-				if args, ok := data["arguments"].(string); ok {
-					p.toolArgs[id] = args
-				}
 				}
 			}
 		}
@@ -291,60 +276,12 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 		sess.TotalCharsOffloaded += len(resultStr)
 		sess.EstimatedTokensSaved += len(resultStr) / 4
 
-		toolEmoji := "🛠️"
-		switch toolName {
-		case "web_fetch":
-			toolEmoji = "🌐"
-		case "web_search":
-			toolEmoji = "🔍"
-		case "exec":
-			toolEmoji = "💻"
-		case "read_file":
-			toolEmoji = "📄"
-		case "write_file", "edit_file":
-			toolEmoji = "✏️"
-		}
-
-		// Try to get tool call context (URL, command, etc.)
-		toolContext := ""
-		if data, ok := resultData.(map[string]interface{}); ok {
-			if id, ok := data["id"].(string); ok {
-				if args, ok := p.toolArgs[id]; ok {
-					// Try to extract URL or command from arguments
-					var argsMap map[string]interface{}
-					if err := json.Unmarshal([]byte(args), &argsMap); err == nil {
-						if url, ok := argsMap["url"].(string); ok {
-							toolContext = url
-						} else if cmd, ok := argsMap["command"].(string); ok {
-							if len(cmd) > 60 {
-								cmd = cmd[:60] + "..."
-							}
-							toolContext = cmd
-						} else if query, ok := argsMap["query"].(string); ok {
-							if len(query) > 60 {
-								query = query[:60] + "..."
-							}
-							toolContext = query
-						}
-					}
-				}
-			}
-		}
-
-		summaryLine := fmt.Sprintf("%s  %s  · 已完成  %d 字符", toolEmoji, toolName, len([]rune(resultStr)))
-		if toolContext != "" {
-			summaryLine = fmt.Sprintf("%s  %s · %s  · 已完成  %d 字符", toolEmoji, toolName, toolContext, len([]rune(resultStr)))
-		}
-
-		charCount := len([]rune(resultStr))
 		summary := map[string]interface{}{
 			"type": "tool_result",
 			"data": map[string]interface{}{
-				"summary": fmt.Sprintf("%s", summaryLine),
+				"summary": fmt.Sprintf("[工具结果已保存至 %s，共 %d 字符]",
+					refPath, len([]rune(resultStr))),
 				"ref": refPath,
-				"tool_name": toolName,
-				"char_count": charCount,
-				"context": toolContext,
 			},
 		}
 		modified, _ := json.Marshal(summary)
