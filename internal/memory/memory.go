@@ -59,9 +59,30 @@ func migrate(db *sql.DB) error {
 			updated_at DATETIME,
 			metadata TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS refs (
+			ref_id TEXT PRIMARY KEY,
+			agent_id TEXT NOT NULL DEFAULT '',
+			session_id TEXT DEFAULT '',
+			tool_name TEXT NOT NULL DEFAULT '',
+			node_id TEXT DEFAULT '',
+			content TEXT NOT NULL,
+			summary TEXT DEFAULT '',
+			tags TEXT DEFAULT '[]',
+			size INTEGER DEFAULT 0,
+			created_at DATETIME
+		)`,
+		`CREATE TABLE IF NOT EXISTS personas (
+			user_id TEXT PRIMARY KEY,
+			persona TEXT NOT NULL DEFAULT '{}',
+			version INTEGER DEFAULT 1,
+			created_at DATETIME,
+			updated_at DATETIME
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(agent_id, type)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_refs_agent ON refs(agent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_refs_tool ON refs(tool_name)`,
 	}
 
 	for _, q := range queries {
@@ -141,4 +162,20 @@ func (s *Store) SearchMemories(agentID, participant string, limit int) ([]map[st
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// Exec 执行 SQL 语句（供 REST API 使用）
+func (s *Store) Exec(query string, args ...interface{}) error {
+	_, err := s.db.Exec(query, args...)
+	return err
+}
+
+// Query 执行 SQL 查询（供 REST API 使用）
+func (s *Store) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return s.db.Query(query, args...)
+}
+
+// QueryRow 执行单行查询（供 REST API 使用）
+func (s *Store) QueryRow(query string, args ...interface{}) *sql.Row {
+	return s.db.QueryRow(query, args...)
 }

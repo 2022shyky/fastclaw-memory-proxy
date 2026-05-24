@@ -60,7 +60,7 @@ func (e *Engine) AddNode(agentID, sessionID string, event map[string]interface{}
 	sess := e.getSession(agentID, sessionID)
 
 	data, _ := event["data"].(map[string]interface{})
-	toolName, _ := data["tool_name"].(string)
+	toolName, _ := data["name"].(string)
 	if toolName == "" {
 		return
 	}
@@ -90,10 +90,10 @@ func (e *Engine) MarkDone(agentID, sessionID, toolName string) {
 		return
 	}
 
-	for i := len(sess.Nodes) - 1; i >= 0; i-- {
+	// Mark ALL matching running nodes as done (same tool may be called multiple times)
+	for i := range sess.Nodes {
 		if sess.Nodes[i].ToolName == toolName && sess.Nodes[i].Status == "running" {
 			sess.Nodes[i].Status = "done"
-			break
 		}
 	}
 }
@@ -163,10 +163,14 @@ func (e *Engine) Finalize(agentID, sessionID string) {
 
 	mmdPath := fmt.Sprintf("%s/%s.mmd", dir, sessionID)
 	os.WriteFile(mmdPath, []byte(mmd), 0644)
+	// Also write latest.mmd so the request handler can easily find it
+	os.WriteFile(fmt.Sprintf("%s/latest.mmd", dir), []byte(mmd), 0644)
 
 	jsonPath := fmt.Sprintf("%s/%s.json", dir, sessionID)
 	data, _ := json.MarshalIndent(sess, "", "  ")
 	os.WriteFile(jsonPath, data, 0644)
+	// Also write latest.json
+	os.WriteFile(fmt.Sprintf("%s/latest.json", dir), data, 0644)
 
 	slog.Info("canvas saved", "agent", agentID, "session", sessionID, "nodes", len(sess.Nodes))
 }

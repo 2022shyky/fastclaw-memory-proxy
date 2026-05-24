@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shyky/memory-proxy/internal/canvas"
@@ -19,13 +21,59 @@ import (
 	"github.com/shyky/memory-proxy/internal/stats"
 )
 
+// toolCallCache provides session-isolated, thread-safe caching of tool call metadata.
+type toolCallCache struct {
+	sync.RWMutex
+	calls map[string]map[string]toolCallInfo // sessionID → toolCallID → info
+}
+
+type toolCallInfo struct {
+	name string
+	args string
+}
+
+func newToolCallCache() *toolCallCache {
+	return &toolCallCache{calls: make(map[string]map[string]toolCallInfo)}
+}
+
+func (c *toolCallCache) Set(sessionID, callID, name, args string) {
+	c.Lock()
+	defer c.Unlock()
+	if _, ok := c.calls[sessionID]; !ok {
+		c.calls[sessionID] = make(map[string]toolCallInfo)
+	}
+	c.calls[sessionID][callID] = toolCallInfo{name: name, args: args}
+}
+
+func (c *toolCallCache) Get(sessionID, callID string) (toolCallInfo, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	sess, ok := c.calls[sessionID]
+	if !ok {
+		return toolCallInfo{}, false
+	}
+	info, ok := sess[callID]
+	return info, ok
+}
+
+func (c *toolCallCache) Cleanup(sessionID string) {
+	c.Lock()
+	defer c.Unlock()
+	delete(c.calls, sessionID)
+}
+
+func (c *toolCallCache) Len() int {
+	c.RLock()
+	defer c.RUnlock()
+	return len(c.calls)
+}
+
 type MemoryProxy struct {
 	cfg       *config.Config
 	canvas    *canvas.Engine
 	stats     *stats.Collector
 	memory    *memory.Store
-	toolNames map[string]string // tool_call id → name mapping
-	toolArgs map[string]string // tool_call id → arguments
+	toolCache *toolCallCache
 }
 
 func New(cfg *config.Config) (*MemoryProxy, error) {
@@ -39,8 +87,7 @@ func New(cfg *config.Config) (*MemoryProxy, error) {
 		canvas:    canvas.New(cfg.DataDir),
 		stats:     stats.New(cfg),
 		memory:    store,
-		toolNames: make(map[string]string),
-		toolArgs: make(map[string]string),
+		toolCache: newToolCallCache(),
 	}, nil
 }
 
@@ -50,6 +97,16 @@ func (p *MemoryProxy) Start() error {
 	mux.HandleFunc("/api/chat", p.handleChat)
 	mux.HandleFunc("/api/chat/stream", p.handleChatStream)
 	mux.HandleFunc("/health", p.handleHealth)
+
+	// REST API endpoints (memory-manager & external tools)
+	mux.HandleFunc("POST /api/refs", p.handleCreateRef)
+	mux.HandleFunc("GET /api/refs/{ref_id}", p.handleGetRef)
+	mux.HandleFunc("GET /api/refs", p.handleListRefs)
+	mux.HandleFunc("POST /api/memory", p.handleCreateMemory)
+	mux.HandleFunc("GET /api/memory/search", p.handleSearchMemory)
+	mux.HandleFunc("DELETE /api/memory/{memory_id}", p.handleDeleteMemory)
+	mux.HandleFunc("GET /api/persona/{user_id}", p.handleGetPersona)
+	mux.HandleFunc("PUT /api/persona/{user_id}", p.handleUpdatePersona)
 
 	// Default catch-all: reverse proxy everything else to FastClaw
 	targetURL, _ := url.Parse(p.cfg.Target)
@@ -67,6 +124,20 @@ func (p *MemoryProxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// isManagedAgent checks if the agent is in the managed list.
+// An empty list means all agents are managed.
+func (p *MemoryProxy) isManagedAgent(agentID string) bool {
+	if len(p.cfg.Agents) == 0 {
+		return true
+	}
+	for _, a := range p.cfg.Agents {
+		if a == agentID {
+			return true
+		}
+	}
+	return false
 }
 
 // handleChat proxies non-streaming chat requests
@@ -111,7 +182,7 @@ func (p *MemoryProxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	slog.Info("non-stream session complete", "agent", agentID, "session", sessionID)
 }
 
-// handleChatStream proxies streaming chat requests and intercepts tool results
+// handleChatStream proxies streaming chat requests and intercepts tool results.
 func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -120,14 +191,14 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	var reqBody map[string]interface{}
-	json.Unmarshal(bodyBytes, &reqBody)
-	agentID, _ := reqBody["agentId"].(string)
+	agentID, modifiedBody := p.extractAgentAndInjectCanvas(bodyBytes)
 	sessionID := fmt.Sprintf("session-%d", time.Now().UnixNano())
+
+	managed := p.isManagedAgent(agentID)
 
 	// Forward to FastClaw streaming endpoint
 	targetURL := p.cfg.Target + "/api/chat/stream"
-	proxyReq, err := http.NewRequest("POST", targetURL, strings.NewReader(string(bodyBytes)))
+	proxyReq, err := http.NewRequest("POST", targetURL, strings.NewReader(string(modifiedBody)))
 	if err != nil {
 		http.Error(w, "proxy error", http.StatusInternalServerError)
 		return
@@ -151,7 +222,6 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	isStream := strings.Contains(contentType, "text/event-stream") || strings.Contains(contentType, "application/x-ndjson")
 
 	if !isStream {
-		// Non-streaming response — pass through
 		w.Header().Set("Content-Type", contentType)
 		io.Copy(w, resp.Body)
 		return
@@ -169,13 +239,34 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess := p.stats.NewSession(agentID, sessionID)
+	var sess *stats.SessionStats
+	if managed {
+		sess = p.stats.NewSession(agentID, sessionID)
+	}
+
+	// Close upstream connection when client disconnects
+	clientDone := make(chan struct{})
+	go func() {
+		select {
+		case <-r.Context().Done():
+			slog.Warn("client disconnected, closing upstream", "agent", agentID, "session", sessionID)
+			resp.Body.Close()
+		case <-clientDone:
+		}
+	}()
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// For unmanaged agents, pass through SSE lines unmodified
+		if !managed {
+			fmt.Fprintf(w, "%s\n", line)
+			flusher.Flush()
+			continue
+		}
 
 		// SSE comment lines (starting with ":") — pass through
 		if strings.HasPrefix(line, ":") {
@@ -206,17 +297,34 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 		flusher.Flush()
 	}
+	close(clientDone)
 
-	p.canvas.Finalize(agentID, sessionID)
-	p.stats.FinalizeSession(sess)
-	p.memory.SaveSessionSummary(agentID, sessionID, sess)
+	// Check for scanner errors — critical for SSE reliability
+	if err := scanner.Err(); err != nil {
+		slog.Error("SSE stream error", "error", err, "agent", agentID, "session", sessionID)
+		// Send error event so the browser stops waiting for more data
+		errEvent := map[string]interface{}{
+			"type": "error",
+			"data": map[string]interface{}{
+				"message": fmt.Sprintf("stream error: %s", err.Error()),
+			},
+		}
+		errJSON, _ := json.Marshal(errEvent)
+		fmt.Fprintf(w, "data: %s\n\n", errJSON)
+		flusher.Flush()
+		return
+	}
+
+	if managed {
+		p.canvas.Finalize(agentID, sessionID)
+		p.stats.FinalizeSession(sess)
+		p.memory.SaveSessionSummary(agentID, sessionID, sess)
+		p.toolCache.Cleanup(sessionID)
+	}
 
 	slog.Info("stream session complete",
 		"agent", agentID,
 		"session", sessionID,
-		"tools_intercepted", sess.ToolResultsIntercepted,
-		"chars_saved", sess.TotalCharsOffloaded,
-		"tokens_saved", sess.EstimatedTokensSaved,
 	)
 }
 
@@ -234,14 +342,13 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 	case "tool_call":
 		p.canvas.AddNode(agentID, sessionID, event)
 		sess.CanvasUpdates++
-		// Cache id → name mapping for tool_result lookup
+		// Cache id → name mapping for tool_result lookup (session-isolated)
 		if data, ok := event["data"].(map[string]interface{}); ok {
 			if id, ok := data["id"].(string); ok {
-				if name, ok := data["name"].(string); ok {
-					p.toolNames[id] = name
-				if args, ok := data["arguments"].(string); ok {
-					p.toolArgs[id] = args
-				}
+				name, _ := data["name"].(string)
+				args, _ := data["arguments"].(string)
+				if name != "" {
+					p.toolCache.Set(sessionID, id, name, args)
 				}
 			}
 		}
@@ -270,8 +377,8 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 			// Fallback: look up by id from cached tool_calls
 			if toolName == "unknown" {
 				if id, ok := data["id"].(string); ok {
-					if name, ok := p.toolNames[id]; ok {
-						toolName = name
+					if info, ok := p.toolCache.Get(sessionID, id); ok {
+						toolName = info.name
 					}
 				}
 			}
@@ -309,10 +416,9 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 		toolContext := ""
 		if data, ok := resultData.(map[string]interface{}); ok {
 			if id, ok := data["id"].(string); ok {
-				if args, ok := p.toolArgs[id]; ok {
-					// Try to extract URL or command from arguments
+				if info, ok := p.toolCache.Get(sessionID, id); ok && info.args != "" {
 					var argsMap map[string]interface{}
-					if err := json.Unmarshal([]byte(args), &argsMap); err == nil {
+					if err := json.Unmarshal([]byte(info.args), &argsMap); err == nil {
 						if url, ok := argsMap["url"].(string); ok {
 							toolContext = url
 						} else if cmd, ok := argsMap["command"].(string); ok {
@@ -340,11 +446,11 @@ func (p *MemoryProxy) processLine(line, agentID, sessionID string, sess *stats.S
 		summary := map[string]interface{}{
 			"type": "tool_result",
 			"data": map[string]interface{}{
-				"summary": fmt.Sprintf("%s", summaryLine),
-				"ref": refPath,
-				"tool_name": toolName,
+				"summary":    fmt.Sprintf("%s", summaryLine),
+				"ref":        refPath,
+				"tool_name":  toolName,
 				"char_count": charCount,
-				"context": toolContext,
+				"context":    toolContext,
 			},
 		}
 		modified, _ := json.Marshal(summary)
@@ -386,8 +492,8 @@ func (p *MemoryProxy) writeTaskLog(agentID, toolName, result string) {
 	filePath := fmt.Sprintf("%s/%s.jsonl", dir, date)
 
 	entry := map[string]interface{}{
-		"timestamp": time.Now().Format(time.RFC3339),
-		"tool":      toolName,
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"tool":       toolName,
 		"result_len": len(result),
 	}
 	line, _ := json.Marshal(entry)
@@ -403,7 +509,6 @@ func (p *MemoryProxy) writeTaskLog(agentID, toolName, result string) {
 }
 
 func sanitizeName(name string) string {
-	// Replace unsafe filename characters
 	name = strings.ReplaceAll(name, "/", "-")
 	name = strings.ReplaceAll(name, "\\", "-")
 	name = strings.ReplaceAll(name, " ", "_")
@@ -416,9 +521,99 @@ func sanitizeName(name string) string {
 func randomSuffix(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
+	rand.Read(b)
 	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
-		time.Sleep(time.Microsecond)
+		b[i] = letters[int(b[i])%len(letters)]
 	}
 	return string(b)
+}
+
+// injectCanvas reads the latest canvas Mermaid for this agent and injects it
+// into the system message of the request body, so the LLM sees the task canvas.
+func (p *MemoryProxy) injectCanvas(agentID string, bodyBytes []byte) []byte {
+	if agentID == "" {
+		return bodyBytes
+	}
+
+	canvasPath := fmt.Sprintf("%s/canvas/%s/latest.mmd", p.cfg.DataDir, agentID)
+	mmd, err := os.ReadFile(canvasPath)
+	if err != nil {
+		return bodyBytes // No canvas yet — first turn
+	}
+	mmdStr := strings.TrimSpace(string(mmd))
+	if mmdStr == "" {
+		return bodyBytes
+	}
+
+	var reqBody map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		return bodyBytes
+	}
+
+	messages, ok := reqBody["messages"].([]interface{})
+	if !ok {
+		return bodyBytes
+	}
+
+	// Determine which nodes are still running for the status summary
+	var runningNodes, doneNodes int
+	for _, line := range strings.Split(mmdStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "⏳") {
+			runningNodes++
+		} else if strings.Contains(line, "✅") {
+			doneNodes++
+		}
+	}
+
+	// Build the canvas section to inject
+	mermaidBlock := "```mermaid\n" + mmdStr + "\n```"
+	canvasSection := fmt.Sprintf("\n### 任务画布\n\n%s\n\n**当前状态**: %d 个节点已完成, %d 个节点执行中\n**注意**: 已完成节点无需重复执行，关注当前执行中的节点。\n",
+		mermaidBlock, doneNodes, runningNodes)
+
+	// Find system message and append canvas
+	modified := false
+	for i, msg := range messages {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role == "system" {
+			content, _ := m["content"].(string)
+			m["content"] = content + "\n" + canvasSection
+			messages[i] = m
+			modified = true
+			break
+		}
+	}
+
+	if !modified {
+		// No system message — prepend one with the canvas
+		canvasMsg := map[string]interface{}{
+			"role":    "system",
+			"content": canvasSection,
+		}
+		reqBody["messages"] = append([]interface{}{canvasMsg}, messages...)
+	}
+
+	newBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return bodyBytes
+	}
+	slog.Debug("canvas injected into request", "agent", agentID)
+	return newBody
+}
+
+// extractAgentAndInjectCanvas parses the request body, extracts agentID,
+// and returns (agentID, possibly-modified-body).
+func (p *MemoryProxy) extractAgentAndInjectCanvas(bodyBytes []byte) (string, []byte) {
+	var reqBody map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		return "", bodyBytes
+	}
+	agentID, _ := reqBody["agentId"].(string)
+
+	modifiedBody := p.injectCanvas(agentID, bodyBytes)
+	return agentID, modifiedBody
 }
