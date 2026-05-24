@@ -184,6 +184,13 @@ func (p *MemoryProxy) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // handleChatStream proxies streaming chat requests and intercepts tool results.
 func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
+	// GET = EventSource reconnect — just reverse-proxy raw, no offloading
+	if r.Method == "GET" {
+		targetURL, _ := url.Parse(p.cfg.Target)
+		httputil.NewSingleHostReverseProxy(targetURL).ServeHTTP(w, r)
+		return
+	}
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -255,22 +262,31 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
+	reader := bufio.NewReader(resp.Body)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			slog.Warn("SSE stream closed unexpectedly", "error", err, "agent", agentID, "session", sessionID)
+			break
+		}
+
+		line := strings.TrimSuffix(string(lineBytes), "\r\n")
+		line = strings.TrimSuffix(line, "\n")
 
 		// For unmanaged agents, pass through SSE lines unmodified
 		if !managed {
-			fmt.Fprintf(w, "%s\n", line)
+			w.Write(lineBytes)
 			flusher.Flush()
 			continue
 		}
 
 		// SSE comment lines (starting with ":") — pass through
 		if strings.HasPrefix(line, ":") {
-			fmt.Fprintf(w, "%s\n", line)
+			w.Write(lineBytes)
 			flusher.Flush()
 			continue
 		}
@@ -293,27 +309,11 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		if modified != "" {
 			fmt.Fprintf(w, "data: %s\n\n", modified)
 		} else {
-			fmt.Fprintf(w, "%s\n", line)
+			w.Write(lineBytes)
 		}
 		flusher.Flush()
 	}
 	close(clientDone)
-
-	// Check for scanner errors — critical for SSE reliability
-	if err := scanner.Err(); err != nil {
-		slog.Error("SSE stream error", "error", err, "agent", agentID, "session", sessionID)
-		// Send error event so the browser stops waiting for more data
-		errEvent := map[string]interface{}{
-			"type": "error",
-			"data": map[string]interface{}{
-				"message": fmt.Sprintf("stream error: %s", err.Error()),
-			},
-		}
-		errJSON, _ := json.Marshal(errEvent)
-		fmt.Fprintf(w, "data: %s\n\n", errJSON)
-		flusher.Flush()
-		return
-	}
 
 	if managed {
 		p.canvas.Finalize(agentID, sessionID)
