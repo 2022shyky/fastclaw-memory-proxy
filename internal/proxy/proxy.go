@@ -96,6 +96,7 @@ func (p *MemoryProxy) Start() error {
 	// FastClaw actual routes: /api/chat (non-streaming) and /api/chat/stream (streaming)
 	mux.HandleFunc("/api/chat", p.handleChat)
 	mux.HandleFunc("/api/chat/stream", p.handleChatStream)
+	mux.HandleFunc("/api/chat/subscribe", p.handleSubscribe)
 	mux.HandleFunc("/health", p.handleHealth)
 
 	// REST API endpoints (memory-manager & external tools)
@@ -326,6 +327,71 @@ func (p *MemoryProxy) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		"agent", agentID,
 		"session", sessionID,
 	)
+}
+
+// handleSubscribe proxies FastClaw's EventSource endpoint /api/chat/subscribe
+func (p *MemoryProxy) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	// Forward to Gateway directly via catch-all ReverseProxy
+	// The request path /api/chat/subscribe is preserved
+	targetURL, _ := url.Parse(p.cfg.Target)
+	rp := httputil.NewSingleHostReverseProxy(targetURL)
+	rp.FlushInterval = 50 * time.Millisecond
+
+	if p.cfg.APIKey != "" {
+		director := rp.Director
+		rp.Director = func(req *http.Request) {
+			director(req)
+			req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
+		}
+	}
+
+	// Extract agent/session from original request for wrapSSEBody
+	wrapID := r.URL.Query().Get("agentId")
+	sessionID := r.URL.Query().Get("sessionId")
+
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if wrapID != "" && sessionID != "" && p.isManagedAgent(wrapID) &&
+			strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			sess := p.stats.NewSession(wrapID, sessionID)
+			resp.Body = p.wrapSSEBody(resp.Body, wrapID, sessionID, sess)
+		}
+		return nil
+	}
+
+	rp.ServeHTTP(w, r)
+}
+
+// wrapSSEBody returns a Pipe that wraps an SSE response body, intercepting
+// tool_results for context offloading while passing through all other events.
+func (p *MemoryProxy) wrapSSEBody(body io.ReadCloser, agentID, sessionID string, sess *stats.SessionStats) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		scanner := bufio.NewScanner(body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			dataPayload := line
+			if strings.HasPrefix(line, "data: ") {
+				dataPayload = strings.TrimPrefix(line, "data: ")
+			}
+			modified := p.processLine(dataPayload, agentID, sessionID, sess)
+			if modified != "" {
+				pw.Write([]byte(fmt.Sprintf("data: %s\n\n", modified)))
+			} else {
+				pw.Write([]byte(line + "\n"))
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			slog.Warn("wrapSSEBody scanner error", "error", err, "agent", agentID, "session", sessionID)
+		}
+		body.Close()
+		// Finalize managed session
+		p.canvas.Finalize(agentID, sessionID)
+		p.stats.FinalizeSession(sess)
+		p.memory.SaveSessionSummary(agentID, sessionID, sess)
+		p.toolCache.Cleanup(sessionID)
+		pw.Close()
+	}()
+	return pr
 }
 
 // processLine inspects a single JSON line from the stream.
